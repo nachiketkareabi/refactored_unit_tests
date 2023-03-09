@@ -2,11 +2,21 @@ import os
 from configs.config import get_config
 import pandas as pd
 import numpy as np
+import datetime
+import logging
 import json
 import joblib
 from loguru import logger
+from typing import Dict, List, Any
+import pickle
+import h5py
+import onnx
+from sklearn.impute import SimpleImputer
 
-# TODO: modify create_folder, create_folders, check_file_exists, check_files_exists for Azure databricks file system
+base_path = ""
+if "DATABRICKS_RUNTIME_VERSION" in os.environ:
+    user_name = "nachiket.kare-ext@ab-inbev.com"
+    base_path = f"/dbfs/Users/{user_name}/"
 
 
 def create_folder(folder_path):
@@ -154,6 +164,7 @@ def read_sample_data(
 def optimize_numeric_data_types(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.columns:
         if df[col].dtype == "int64":
+            print("int64")
             if (
                 df[col].min() > np.iinfo(np.int8).min
                 and df[col].max() < np.iinfo(np.int8).max
@@ -413,8 +424,177 @@ def extract_unique_counts(data, unique_count_cols):
     return unique_counts
 
 
-if __name__ == "__main__":
+def write_data(data: pd.DataFrame, file_path: str, file_name: str = None) -> bool:
+    # Function to write given data to the provided path
+    if file_name:
+        file_path = os.path.join(file_path, file_name)
 
+    fmt = file_path.split(".")[-1]
+    if fmt not in ["csv", "xlsx", "xls", "parquet"]:
+        raise "Format not recognized. Currently supported formats: Excel, CSV or Parquet"
+
+    if fmt == "csv":
+        data.to_csv(file_path, index=False)
+    elif fmt in ["xlsx", "xls"]:
+        data.to_excel(file_path, index=False)
+    elif fmt == "parquet":
+        data.to_parquet(file_path)
+
+
+def read_model(file_path: str) -> None:
+    # Function to read model file from the provded location
+    fmt = file_path.split(".")[-1]
+    if fmt not in ["hdf5", "pkl", "onnx"]:
+        raise "Model file format not supported. Current supported formats: pkl, hdf5, onnx"
+    model = None
+
+    if fmt == "pkl":
+        with open(file_path, "r") as f:
+            model = pickle.load(f)
+    elif fmt == "hdf5":
+        with h5py.File(file_path, "r") as f:
+            model = f
+    elif fmt == "onnx":
+        model = onnx.load(file_path)
+
+    return model
+
+
+def write_model(model, file_path: str) -> bool:
+    # Function to write the given model to the provided path
+    fmt = file_path.split(".")[-1]
+
+    if fmt not in ["hdf5", "pkl", "onnx"]:
+        raise "Model file format not supported. Current supported formats: pkl, hdf5, onnx"
+    model = None
+
+    if fmt == "pkl":
+        with open(file_path, "w") as f:
+            pickle.dump(model, f)
+    elif fmt == "hdf5":
+        with h5py.File(file_path, "w") as f:
+            f.create_dataset(file_path, model)
+    elif fmt == "onnx":
+        onnx.save(model, file_path)
+
+
+def parse_date(data: pd.DataFrame, date_formats: Dict[str, str]) -> pd.DataFrame:
+    for col, fmt in date_formats.items():
+        df[col] = pd.to_datetime(df[col], format=fmt)
+    return df
+
+
+def get_date_frequency(df: pd.DataFrame, date_cols: List[str]) -> Dict[str, str]:
+    output_dict = {}
+    for date_col in date_cols:
+        output_dict[date_col] = df[date_col].dt.freq
+    return output_dict
+
+
+def _helper_date_format_matcher(date_series: pd.Series, fmt: str) -> str:
+    try:
+        date_list = date_series.astype("str").tolist()
+        _ = [datetime.datetime.strptime(dt, fmt) for dt in date_list]
+        return fmt
+    except Exception as e:
+        print(f"{fmt} does not match")
+    return None
+
+
+def get_date_format(df: pd.DataFrame, date_cols: List[str]) -> Dict[str, Any]:
+    accepted_date_formats = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%m/%d/%Y",
+        "%m-%d-%Y",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+    ]
+    output_dict = {}
+    for date_col in date_cols:
+        output_formats = [
+            date_format
+            for date_format in accepted_date_formats
+            if _helper_date_format_matcher(df[date_col], date_format) is not None
+        ]
+        if len(output_formats) == 1:
+            output_dict[date_col] = output_formats[0]
+        else:
+            output_dict[date_col] = None
+
+
+def get_unique_values(df: pd.DataFrame, col_names) -> Dict[str, List]:
+    output_dict = {}
+    for col in col_names:
+        output_dict[col] = df[col].unique().tolist()
+    return output_dict
+
+
+def filter_by_range(df: pd.DataFrame, range_dict: Dict[str, Dict[str, float]]):
+    for col, val_dict in range_dict.items():
+        df[col] = df.loc[
+            ((df[col] >= val_dict["min"]) & (df[col] < val_dict["min"])), col
+        ]
+    return df
+
+
+def filter_by_values(df: pd.DataFrame, filter_dict: Dict[str, List[float]]):
+    for col, val_list in filter_dict.items():
+        df[col] = df[col].isin(val_list)
+    return df
+
+
+def apply_imputations(
+    df: pd.DataFrame, imputation_dict: Dict[str, str]
+) -> pd.DataFrame:
+    for col_name, strategy_name in imputation_dict.items():
+        if strategy_name in ["mean", "median", "most_frequent", "constant"]:
+            imputer = SimpleImputer(strategy=strategy_name)
+            df[col_name] = imputer.transform(df[col_name])
+        else:
+            print(f"Invalid {strategy_name} provided for {col_name}.")
+    return df
+
+
+def subset_cols(df: pd.DataFrame, subset_col: List[str]) -> pd.DataFrame:
+    try:
+        return df[subset_col]
+    except:
+        missing_cols = set(subset_col) - df.columns
+        print(f"Missing columns: {missing_cols}")
+
+
+def validate_data_types(df: pd.DataFrame, col_data_types: Dict[str, str]) -> bool:
+    return df.dtypes.apply(lambda x: x.name).to_dict() == col_data_types
+
+
+def check_nan_values(df: pd.DataFrame, nan_cols: List[str]) -> Dict[str, bool]:
+    output_dict = {}
+    for col in nan_cols:
+        output_dict[col] = df[col].isna()
+    return output_dict
+
+
+def validate_unique_values(
+    df: pd.DataFrame, unique_value_dict: Dict[str, List[Any]]
+) -> Dict[str, bool]:
+    output_dict = {}
+    for col, unique_vals in unique_value_dict.items():
+        output_dict[col] = all(val in df[col].unique() for val in unique_vals)
+    return output_dict
+
+
+def validate_date(
+    df: pd.DataFrame, date_col_list: List[str], cutoff_days: int = 7
+) -> Dict[str, bool]:
+    output_dict = {}
+    for col in date_col_list:
+        output_dict[col] = (
+            datetime.datetime.now().date() - df[col].max().date()
+        ).days > cutoff_days
+
+
+if __name__ == "__main__":
     # Configs
     io_config = {
         "data_directory": "data",
@@ -672,10 +852,9 @@ if __name__ == "__main__":
         v: k for k, v in processor_config["pre_processor"]["column_mapper"].items()
     }
 
-    # Data IO
     # Logging
     logger.add(
-        os.path.join(io_config["log_directory"], "data_preparation.log"),
+        os.path.join(base_path, io_config["log_directory"], "data_preparation.log"),
         rotation="10 MB",
         level="INFO",
     )
@@ -689,23 +868,22 @@ if __name__ == "__main__":
         "configs",
         "logs",
     ]
-    create_folders(folder_list)
+    create_folders(map(lambda x: os.path.join(base_path, x), folder_list))
     files_list = [
         "data/raw/raw_data.csv",
         "data/raw/test.csv",
         "data/raw/sample_submission.csv",
     ]
-    print(check_files_exists(files_list))
-    # Download from data store or config store and store it in right place:
-    # either read from local FS, data store/blob/db, config store/blob/db, dvc. fs. specific file location in local FS
+    print(check_files_exists(map(lambda x: os.path.join(base_path, x), files_list)))
     df = synthetic_data()
     df.to_csv(
-        os.path.join(io_config["data_directory"], "raw", "raw_data.csv"), index=False
+        os.path.join(base_path, io_config["data_directory"], "raw", "raw_data.csv"),
+        index=False,
     )
     print(df.head())
     show_config()
     sample_data = read_sample_data(
-        os.path.join(io_config["data_directory"], "raw"),
+        os.path.join(base_path, io_config["data_directory"], "raw"),
         "raw_data.csv",
         100,
         io_config["select_columns"],
@@ -714,11 +892,11 @@ if __name__ == "__main__":
         io_config["compression"],
     )
     print(sample_data.head())
-    # FIXME: Next line is not working as expected. Why int64 is not getting converted to int32? Debug it.
     type_optimized_data = generate_optimized_data_schema(
         sample_data, io_config, parsing_config
     )
     print(type_optimized_data.head())
+    print(type_optimized_data.dtypes)
     optimized_data_schema = (
         type_optimized_data.select_dtypes(
             include=["number", "category", "bool", "object"]
@@ -728,13 +906,13 @@ if __name__ == "__main__":
     )
     print(optimized_data_schema)
     write_config(
-        io_config["config_directory"],
-        parsing_config["optimized_data_schema_file_name"],
+        os.path.join(base_path, io_config["config_directory"]),
+        "optimized_data_schema.json",
         optimized_data_schema,
         "json",
     )
     full_data = read_full_data(
-        os.path.join(io_config["data_directory"], "raw"),
+        os.path.join(base_path, io_config["data_directory"], "raw"),
         "raw_data.csv",
         io_config["select_columns"],
         parsing_config["date_format_configs"],
@@ -776,6 +954,15 @@ if __name__ == "__main__":
             + list(parsing_config["date_format_configs"].keys()),
         )
     )
+    print(parse_date(full_data, parsing_config["date_format_configs"]))
+    print(get_date_frequency(full_data, ["date"]))
+    print(get_date_format(full_data, ["date"]))
+    print(get_unique_values(full_data, ["date"]))
+    print(apply_imputations(full_data, {"quantity": "mean"}))
+    print(
+        f"Is Data Type Validated: {validate_data_types(full_data, {'poc_id': 'category', 'sku_id': 'category', 'date': 'datetime64[ns]', 'quantity': 'float16'})}"
+    )
+    print(validate_date(full_data, ["date"]))
     if not check_model_id_in_data(
         full_data, processor_config["pre_processor"]["model_id"]
     ):
